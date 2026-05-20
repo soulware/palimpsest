@@ -967,14 +967,11 @@ async fn fork_create_op(
                     elide_core::volume_event::EventKind::Created
                 }
             };
-            elide_coordinator::volume_event_store::emit_best_effort(
-                store,
-                identity.as_ref(),
-                new_name,
-                kind,
-                new_vol_ulid_value,
-            )
-            .await;
+            ctx.core
+                .stores
+                .event_journal()
+                .emit_best_effort(identity.as_ref(), new_name, kind, new_vol_ulid_value)
+                .await;
         }
         Ok(MarkInitialOutcome::AlreadyExists {
             existing_vol_ulid,

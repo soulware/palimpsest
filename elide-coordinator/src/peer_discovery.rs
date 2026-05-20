@@ -32,9 +32,9 @@ use elide_peer_fetch::PeerEndpoint;
 use object_store::ObjectStore;
 use tracing::debug;
 
+use crate::event_journal::{self, EventJournalReader, verify_event_signature};
 use crate::identity;
 use crate::ipc::SignatureStatus;
-use crate::volume_event_store::{self, verify_event_signature};
 
 /// Result of discovery: who the previous claimer was, plus where to
 /// reach them. Returned by [`discover_peer_for_claim`].
@@ -140,19 +140,17 @@ async fn find_releaser(
 /// out of scope for v1).
 pub async fn discover_peer_for_claim(
     store: &Arc<dyn ObjectStore>,
+    journal: &dyn EventJournalReader,
     volume_name: &str,
 ) -> Option<DiscoveredPeer> {
     // Read the `events/<name>/HEAD` window in a single GET — no LIST.
     // The relevant handoff (`Released`, possibly behind one
     // `Claimed`) is always at the log tail, so the window is more
-    // than enough; the back-link walk inside `recent_events` is never
+    // than enough; the back-link walk inside `recent` is never
     // exercised here.
-    let events = match volume_event_store::recent_events(
-        store,
-        volume_name,
-        volume_event_store::DEFAULT_EVENTS_LIMIT,
-    )
-    .await
+    let events = match journal
+        .recent(volume_name, event_journal::DEFAULT_EVENTS_LIMIT)
+        .await
     {
         Ok(v) => v,
         Err(e) => {
@@ -209,8 +207,12 @@ pub async fn discover_peer_for_claim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_journal::{BucketEventJournal, EventJournal};
     use crate::identity::CoordinatorIdentity;
-    use crate::volume_event_store::emit_event;
+
+    fn journal_for(store: &Arc<dyn ObjectStore>) -> BucketEventJournal {
+        BucketEventJournal::new(Arc::clone(store), Arc::clone(store))
+    }
     use elide_core::volume_event::EventKind;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
@@ -233,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn returns_none_when_event_log_is_empty() {
         let store = store().await;
-        let result = discover_peer_for_claim(&store, "missing-vol").await;
+        let result = discover_peer_for_claim(&store, &journal_for(&store), "missing-vol").await;
         assert!(result.is_none());
     }
 
@@ -245,20 +247,21 @@ mod tests {
 
         // Emit Created → Released, both signed by the same coord.
         let vol_ulid = Ulid::new();
-        emit_event(&store, &ident, "vol", EventKind::Created, vol_ulid)
+        journal_for(&store)
+            .emit(&ident, "vol", EventKind::Created, vol_ulid)
             .await
             .unwrap();
-        emit_event(
-            &store,
-            &ident,
-            "vol",
-            EventKind::Released {
-                handoff_snapshot: Ulid::new(),
-            },
-            vol_ulid,
-        )
-        .await
-        .unwrap();
+        journal_for(&store)
+            .emit(
+                &ident,
+                "vol",
+                EventKind::Released {
+                    handoff_snapshot: Ulid::new(),
+                },
+                vol_ulid,
+            )
+            .await
+            .unwrap();
 
         // Publish the peer-endpoint for this coordinator.
         PeerEndpoint::new("10.0.0.42".to_owned(), 8443)
@@ -266,7 +269,7 @@ mod tests {
             .await
             .unwrap();
 
-        let discovered = discover_peer_for_claim(&store, "vol")
+        let discovered = discover_peer_for_claim(&store, &journal_for(&store), "vol")
             .await
             .expect("peer discovered");
         assert_eq!(discovered.coordinator_id, coord_id);
@@ -305,24 +308,24 @@ mod tests {
         // Newest event: a clean Released. Should be the first thing
         // visited by the backward walk.
         let vol_ulid = Ulid::new();
-        emit_event(
-            &store,
-            &ident,
-            "vol",
-            EventKind::Released {
-                handoff_snapshot: Ulid::new(),
-            },
-            vol_ulid,
-        )
-        .await
-        .unwrap();
+        journal_for(&store)
+            .emit(
+                &ident,
+                "vol",
+                EventKind::Released {
+                    handoff_snapshot: Ulid::new(),
+                },
+                vol_ulid,
+            )
+            .await
+            .unwrap();
 
         PeerEndpoint::new("10.0.0.42".to_owned(), 8443)
             .publish(store.as_ref(), &coord_id)
             .await
             .unwrap();
 
-        let discovered = discover_peer_for_claim(&store, "vol")
+        let discovered = discover_peer_for_claim(&store, &journal_for(&store), "vol")
             .await
             .expect("backward walk should short-circuit at the head's Released event");
         assert_eq!(discovered.coordinator_id, coord_id);
@@ -333,16 +336,18 @@ mod tests {
         let store = store().await;
         let (ident, _tmp) = make_coord(&store).await;
         let vol_ulid = Ulid::new();
-        emit_event(&store, &ident, "vol", EventKind::Created, vol_ulid)
+        journal_for(&store)
+            .emit(&ident, "vol", EventKind::Created, vol_ulid)
             .await
             .unwrap();
-        emit_event(&store, &ident, "vol", EventKind::Claimed, vol_ulid)
+        journal_for(&store)
+            .emit(&ident, "vol", EventKind::Claimed, vol_ulid)
             .await
             .unwrap();
         // No Released event — latest is Claimed, which means the
         // volume is still owned. No peer-fetch handoff applies.
 
-        let result = discover_peer_for_claim(&store, "vol").await;
+        let result = discover_peer_for_claim(&store, &journal_for(&store), "vol").await;
         assert!(result.is_none());
     }
 
@@ -359,24 +364,26 @@ mod tests {
         let a_id = a.coordinator_id_str().to_owned();
 
         let vol_ulid = Ulid::new();
-        emit_event(&store, &a, "vol", EventKind::Created, vol_ulid)
+        journal_for(&store)
+            .emit(&a, "vol", EventKind::Created, vol_ulid)
             .await
             .unwrap();
-        emit_event(
-            &store,
-            &a,
-            "vol",
-            EventKind::Released {
-                handoff_snapshot: Ulid::new(),
-            },
-            vol_ulid,
-        )
-        .await
-        .unwrap();
+        journal_for(&store)
+            .emit(
+                &a,
+                "vol",
+                EventKind::Released {
+                    handoff_snapshot: Ulid::new(),
+                },
+                vol_ulid,
+            )
+            .await
+            .unwrap();
         // B has already emitted its Claimed event by the time
         // discovery runs (this is the new ordering after the
         // rebind-into-fork-create refactor).
-        emit_event(&store, &b, "vol", EventKind::Claimed, vol_ulid)
+        journal_for(&store)
+            .emit(&b, "vol", EventKind::Claimed, vol_ulid)
             .await
             .unwrap();
 
@@ -386,7 +393,7 @@ mod tests {
             .await
             .unwrap();
 
-        let discovered = discover_peer_for_claim(&store, "vol")
+        let discovered = discover_peer_for_claim(&store, &journal_for(&store), "vol")
             .await
             .expect("discovery walks past B's Claimed and finds A's Release");
         assert_eq!(discovered.coordinator_id, a_id);
@@ -397,25 +404,26 @@ mod tests {
         let store = store().await;
         let (ident, _tmp) = make_coord(&store).await;
         let vol_ulid = Ulid::new();
-        emit_event(&store, &ident, "vol", EventKind::Created, vol_ulid)
+        journal_for(&store)
+            .emit(&ident, "vol", EventKind::Created, vol_ulid)
             .await
             .unwrap();
         // ForceReleased — the emitter is the recovering coordinator,
         // not the previous owner; peer-fetch must fall back to S3.
-        emit_event(
-            &store,
-            &ident,
-            "vol",
-            EventKind::ForceReleased {
-                handoff_snapshot: Ulid::new(),
-                displaced_coordinator_id: "old-coord".to_owned(),
-            },
-            vol_ulid,
-        )
-        .await
-        .unwrap();
+        journal_for(&store)
+            .emit(
+                &ident,
+                "vol",
+                EventKind::ForceReleased {
+                    handoff_snapshot: Ulid::new(),
+                    displaced_coordinator_id: "old-coord".to_owned(),
+                },
+                vol_ulid,
+            )
+            .await
+            .unwrap();
 
-        let result = discover_peer_for_claim(&store, "vol").await;
+        let result = discover_peer_for_claim(&store, &journal_for(&store), "vol").await;
         assert!(result.is_none());
     }
 
@@ -424,24 +432,25 @@ mod tests {
         let store = store().await;
         let (ident, _tmp) = make_coord(&store).await;
         let vol_ulid = Ulid::new();
-        emit_event(&store, &ident, "vol", EventKind::Created, vol_ulid)
+        journal_for(&store)
+            .emit(&ident, "vol", EventKind::Created, vol_ulid)
             .await
             .unwrap();
-        emit_event(
-            &store,
-            &ident,
-            "vol",
-            EventKind::Released {
-                handoff_snapshot: Ulid::new(),
-            },
-            vol_ulid,
-        )
-        .await
-        .unwrap();
+        journal_for(&store)
+            .emit(
+                &ident,
+                "vol",
+                EventKind::Released {
+                    handoff_snapshot: Ulid::new(),
+                },
+                vol_ulid,
+            )
+            .await
+            .unwrap();
         // Skip publishing the peer-endpoint — coordinator either
         // didn't enable peer-fetch or hasn't started yet.
 
-        let result = discover_peer_for_claim(&store, "vol").await;
+        let result = discover_peer_for_claim(&store, &journal_for(&store), "vol").await;
         assert!(result.is_none());
     }
 }

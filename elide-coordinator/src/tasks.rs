@@ -128,6 +128,7 @@ pub fn peer_fetch_handle() -> Option<&'static PeerFetchHandle> {
 pub async fn run_volume_tasks(
     fork_dir: PathBuf,
     store: Arc<dyn ObjectStore>,
+    journal: Arc<dyn crate::event_journal::EventJournalReader>,
     drain_interval: Duration,
     gc_config: GcConfig,
     mut evict_rx: mpsc::Receiver<(Option<String>, EvictReply)>,
@@ -203,15 +204,17 @@ pub async fn run_volume_tasks(
         // Discovery is best-effort — every failure path here collapses
         // to `None` and prefetch falls through to S3 cleanly.
         let peer_ctx = match (peer_fetch_handle(), read_volume_name(&fork_dir)) {
-            (Some(handle), Some(volume_name)) => {
-                crate::peer_discovery::discover_peer_for_claim(&store, &volume_name)
-                    .await
-                    .map(|discovered| prefetch::PeerFetchContext {
-                        client: handle.client.clone(),
-                        endpoint: discovered.endpoint,
-                        volume_name,
-                    })
-            }
+            (Some(handle), Some(volume_name)) => crate::peer_discovery::discover_peer_for_claim(
+                &store,
+                journal.as_ref(),
+                &volume_name,
+            )
+            .await
+            .map(|discovered| prefetch::PeerFetchContext {
+                client: handle.client.clone(),
+                endpoint: discovered.endpoint,
+                volume_name,
+            }),
             _ => None,
         };
         let prefetch_result =

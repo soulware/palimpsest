@@ -463,10 +463,10 @@ async fn dispatch_json(
             let _ = ipc::write_message(writer, &env).await;
         }
         Request::VolumeEvents { volume, num } => {
-            // Pure read: events/<volume>/HEAD plus coordinators/<other>/coordinator.pub
-            // for per-event signature verify. coord-base scope.
-            let store = ctx.stores.peer_verifier_store();
-            let result = volume_events_typed(&volume, &store, num).await;
+            // Pure-read IPC: read-only journal handle (coord-base) — the
+            // type system rules out an accidental emit on the IPC perimeter.
+            let journal = ctx.stores.event_journal_ro();
+            let result = volume_events_typed(&volume, journal.as_ref(), num).await;
             let env: Envelope<VolumeEventsReply> = result.into();
             let _ = ipc::write_message(writer, &env).await;
         }
@@ -1243,14 +1243,14 @@ async fn volume_status_remote_typed(
 /// same as "name doesn't exist".
 async fn volume_events_typed(
     volume_name: &str,
-    store: &Arc<dyn ObjectStore>,
+    journal: &dyn elide_coordinator::event_journal::EventJournalReader,
     num: Option<usize>,
 ) -> Result<VolumeEventsReply, IpcError> {
-    let limit = num.unwrap_or(elide_coordinator::volume_event_store::DEFAULT_EVENTS_LIMIT);
-    let entries =
-        elide_coordinator::volume_event_store::list_and_verify_events(store, volume_name, limit)
-            .await
-            .map_err(|e| IpcError::store(format!("listing events for {volume_name}: {e}")))?;
+    let limit = num.unwrap_or(elide_coordinator::event_journal::DEFAULT_EVENTS_LIMIT);
+    let entries = journal
+        .list_and_verify(volume_name, limit)
+        .await
+        .map_err(|e| IpcError::store(format!("listing events for {volume_name}: {e}")))?;
     Ok(VolumeEventsReply { events: entries })
 }
 
@@ -1445,7 +1445,7 @@ fn bound_ublk_id(vol_dir: &Path) -> Option<i32> {
 #[allow(clippy::too_many_arguments)]
 async fn emit_release_aftermath(
     data_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
+    journal: &dyn elide_coordinator::event_journal::EventJournal,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     volume_name: &str,
     vol_dir_for_marker: Option<&Path>,
@@ -1463,14 +1463,9 @@ async fn emit_release_aftermath(
              marker: {e} (display-only; bucket state authoritative)"
         );
     }
-    elide_coordinator::volume_event_store::emit_best_effort(
-        store,
-        identity.as_ref(),
-        volume_name,
-        event,
-        vol_ulid,
-    )
-    .await;
+    journal
+        .emit_best_effort(identity.as_ref(), volume_name, event, vol_ulid)
+        .await;
     if clear_breadcrumb
         && let Err(e) = elide_coordinator::remote_breadcrumb::remove(data_dir, volume_name)
     {
@@ -1707,14 +1702,15 @@ async fn create_volume_op(
     .await
     {
         Ok(MarkInitialOutcome::Claimed) => {
-            elide_coordinator::volume_event_store::emit_best_effort(
-                &store,
-                identity.as_ref(),
-                name,
-                elide_core::volume_event::EventKind::Created,
-                vol_ulid,
-            )
-            .await;
+            core.stores
+                .event_journal()
+                .emit_best_effort(
+                    identity.as_ref(),
+                    name,
+                    elide_core::volume_event::EventKind::Created,
+                    vol_ulid,
+                )
+                .await;
         }
         Ok(MarkInitialOutcome::AlreadyExists {
             existing_vol_ulid,
@@ -2137,10 +2133,17 @@ async fn resolve_peer_endpoint_for_volume(
     elide_coordinator::tasks::peer_fetch_handle()?;
     let vol_dir = data_dir.join("by_id").join(volume_ulid.to_string());
     let volume_name = elide_coordinator::tasks::read_volume_name(&vol_dir)?;
-    let store = stores.writer();
-    elide_coordinator::peer_discovery::discover_peer_for_claim(&store, &volume_name)
-        .await
-        .map(|d| d.endpoint)
+    // Cross-coordinator RO reads: events/<name>/HEAD + coordinators/<other>/* —
+    // coord-base scope. The read-only journal carries that.
+    let store = stores.peer_verifier_store();
+    let journal = stores.event_journal_ro();
+    elide_coordinator::peer_discovery::discover_peer_for_claim(
+        &store,
+        journal.as_ref(),
+        &volume_name,
+    )
+    .await
+    .map(|d| d.endpoint)
 }
 
 /// Shared authentication preamble for the macaroon-bound volume-daemon

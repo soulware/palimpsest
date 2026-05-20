@@ -427,6 +427,7 @@ pub async fn spawn_import(
 
     let import_ulid_clone = import_ulid.clone();
     let async_store = store.clone();
+    let async_journal = ctx.core.stores.event_journal();
     let async_vol_name = vol_name.to_owned();
     let async_identity = identity.clone();
     let async_vol_dir = vol_dir.clone();
@@ -483,14 +484,14 @@ pub async fn spawn_import(
                         .await
                     {
                         Ok(MarkInitialOutcome::Claimed) => {
-                            elide_coordinator::volume_event_store::emit_best_effort(
-                                &async_store,
-                                async_identity.as_ref(),
-                                &async_vol_name,
-                                elide_core::volume_event::EventKind::Created,
-                                vol_ulid_value,
-                            )
-                            .await;
+                            async_journal
+                                .emit_best_effort(
+                                    async_identity.as_ref(),
+                                    &async_vol_name,
+                                    elide_core::volume_event::EventKind::Created,
+                                    vol_ulid_value,
+                                )
+                                .await;
                         }
                         Ok(MarkInitialOutcome::AlreadyExists {
                             existing_vol_ulid,

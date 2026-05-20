@@ -477,6 +477,7 @@ pub async fn run(config: CoordinatorConfig, stores: Arc<dyn ScopedStores>) -> Re
                 tasks.spawn(elide_coordinator::tasks::run_volume_tasks(
                     vol_dir.clone(),
                     vol_store,
+                    stores.event_journal_ro(),
                     drain_interval,
                     gc_config.clone(),
                     evict_rx,

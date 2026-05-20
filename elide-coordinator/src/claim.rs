@@ -180,9 +180,16 @@ pub(crate) async fn start_claim(
     ctx: ClaimContext,
 ) -> Result<ClaimStartReply, IpcError> {
     let store = ctx.core.stores.writer();
+    let journal = ctx.core.stores.event_journal();
     let bucket_started = std::time::Instant::now();
-    let bucket =
-        claim_volume_bucket_op(&volume, &ctx.core.data_dir, &store, &ctx.core.identity).await?;
+    let bucket = claim_volume_bucket_op(
+        &volume,
+        &ctx.core.data_dir,
+        &store,
+        journal.as_ref(),
+        &ctx.core.identity,
+    )
+    .await?;
     info!(
         "[claim {volume}] bucket-side claim resolved in {:.2?}",
         bucket_started.elapsed()
@@ -242,6 +249,7 @@ async fn claim_volume_bucket_op(
     volume_name: &str,
     data_dir: &std::path::Path,
     store: &Arc<dyn ObjectStore>,
+    journal: &dyn elide_coordinator::event_journal::EventJournal,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> Result<ClaimReply, IpcError> {
     use elide_coordinator::bucket_position::fetch_position;
@@ -365,14 +373,14 @@ async fn claim_volume_bucket_op(
                              volume.released marker: {e}"
                         );
                     }
-                    elide_coordinator::volume_event_store::emit_best_effort(
-                        store,
-                        identity.as_ref(),
-                        volume_name,
-                        elide_core::volume_event::EventKind::Claimed,
-                        released_vol_ulid,
-                    )
-                    .await;
+                    journal
+                        .emit_best_effort(
+                            identity.as_ref(),
+                            volume_name,
+                            elide_core::volume_event::EventKind::Claimed,
+                            released_vol_ulid,
+                        )
+                        .await;
                     Ok(ClaimReply::Reclaimed)
                 }
                 Ok(MarkReclaimedLocalOutcome::Absent) => Err(IpcError::precondition_failed(
@@ -631,14 +639,17 @@ impl ClaimOrchestrator {
                     "[claim {vol}] early-rebind: bucket → {new_vol_ulid_str} \
                      (provenance pending)"
                 );
-                elide_coordinator::volume_event_store::emit_best_effort(
-                    &store_wide,
-                    self.ctx.core.identity.as_ref(),
-                    &self.volume,
-                    elide_core::volume_event::EventKind::Claimed,
-                    new_vol_ulid,
-                )
-                .await;
+                self.ctx
+                    .core
+                    .stores
+                    .event_journal()
+                    .emit_best_effort(
+                        self.ctx.core.identity.as_ref(),
+                        &self.volume,
+                        elide_core::volume_event::EventKind::Claimed,
+                        new_vol_ulid,
+                    )
+                    .await;
                 self.new_fork = Some(NewForkSkeleton {
                     vol_ulid: new_vol_ulid,
                     dir: new_fork_dir,
@@ -686,9 +697,13 @@ impl ClaimOrchestrator {
         // and coordinators/<other>/peer-endpoint.toml — all RO and all cross-
         // coordinator, so the correct credential is coord-base.
         let store_base = self.ctx.core.stores.peer_verifier_store();
-        if let Some(discovered) =
-            elide_coordinator::peer_discovery::discover_peer_for_claim(&store_base, &self.volume)
-                .await
+        let journal = self.ctx.core.stores.event_journal_ro();
+        if let Some(discovered) = elide_coordinator::peer_discovery::discover_peer_for_claim(
+            &store_base,
+            journal.as_ref(),
+            &self.volume,
+        )
+        .await
         {
             self.peer_ctx = Some(PeerFetchContext {
                 client: handle.client.clone(),

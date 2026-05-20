@@ -37,6 +37,10 @@ use object_store::path::Path;
 use object_store::{GetResult, ObjectMeta, ObjectStore};
 use ulid::Ulid;
 
+use crate::event_journal::{
+    BucketEventJournal, EventJournal, EventJournalReader, ReadOnlyEventJournal,
+};
+
 /// Read-only S3 surface — `coord-base`. Exposes `get` and `head`. A
 /// holder can read individual objects; the containment boundary the
 /// exposed peer-fetch verifier relies on is carried by this type.
@@ -112,6 +116,31 @@ pub trait ScopedStores: Send + Sync {
     /// In-coordinator code uses [`Self::base_ro`]; the read-only
     /// guarantee for this handle rests on `coord-base`'s IAM policy.
     fn peer_verifier_store(&self) -> Arc<dyn ObjectStore>;
+
+    /// Full read+write handle for the per-name event log
+    /// (`events/<name>/…`). Backed by both `coord-writer` (for
+    /// emit's CAS, which runs wholly on one credential) and
+    /// `coord-base` (for the inherited reads, which need
+    /// cross-coordinator pubkey lookups in `list_and_verify`).
+    /// First slice of the domain-typed store layer
+    /// (`docs/design-domain-store.md`); the trait deliberately has
+    /// no `delete`, so a caller holding only an [`EventJournal`]
+    /// cannot violate the append-only invariant.
+    fn event_journal(&self) -> Arc<dyn EventJournal> {
+        Arc::new(BucketEventJournal::new(
+            self.writer(),
+            self.peer_verifier_store(),
+        ))
+    }
+
+    /// Read-only handle for the per-name event log — `coord-base`
+    /// scope. A holder cannot call `emit`, so pure-read call sites
+    /// (`volume events` IPC, peer-discovery) carry no over-privilege
+    /// at the type level either. Mirrors the
+    /// [`ReadStore`] vs `ObjectStore` split.
+    fn event_journal_ro(&self) -> Arc<dyn EventJournalReader> {
+        Arc::new(ReadOnlyEventJournal::new(self.peer_verifier_store()))
+    }
 }
 
 /// Returns the same underlying `Arc<dyn ObjectStore>` for every role

@@ -68,10 +68,14 @@ narrow handle they actually need.
 
 ```rust
 pub trait DomainStores: Send + Sync {
-    // coord-writer-backed
+    // coord-writer-backed (write side); coord-base-backed reads
+    // inherited via the reader supertrait
     fn name_claims(&self)        -> Arc<dyn NameClaims>;
     fn event_journal(&self)      -> Arc<dyn EventJournal>;
     fn own_identity(&self)       -> Arc<dyn OwnIdentity>;
+
+    // coord-base-backed (read only)
+    fn event_journal_ro(&self)   -> Arc<dyn EventJournalReader>;
 
     // coord-data-backed
     fn volume_data(&self, v: &Ulid) -> Arc<dyn VolumeData>;
@@ -80,6 +84,43 @@ pub trait DomainStores: Send + Sync {
     fn control_reader(&self)     -> Arc<dyn ControlPlaneReader>;
 }
 ```
+
+**Read-only sub-traits for the mutate-side handles.** Each write-side
+handle (`NameClaims`, `EventJournal`, `OwnIdentity`) extends a
+*reader* supertrait that holds only the read methods. The mutate
+trait adds the writes. Pure-read call sites take `&dyn FooReader`
+and **cannot** invoke a write at the type level — the same shape
+`ReadStore` vs `ObjectStore` already uses for the role boundary,
+applied to the operation boundary too. Concretely for events:
+
+```rust
+#[async_trait]
+pub trait EventJournalReader: Send + Sync {
+    async fn read_head(&self, name: &str) -> Result<Option<(EventHead, EventHeadToken)>, EventError>;
+    async fn recent(&self, name: &str, limit: usize) -> Result<Vec<VolumeEvent>, EventError>;
+    async fn list_and_verify(&self, name: &str, limit: usize) -> Result<Vec<VolumeEventEntry>, EventError>;
+}
+
+#[async_trait]
+pub trait EventJournal: EventJournalReader {
+    async fn emit(&self, identity: &CoordinatorIdentity, name: &str, kind: EventKind, vol_ulid: Ulid) -> Result<VolumeEvent, EventError>;
+    // emit_best_effort default-method on top
+}
+```
+
+Why split: a read-only path needs `coord-base` (the only role whose
+policy grants `coordinators/<other>/*` reads, required by
+`list_and_verify`'s pubkey lookup); the emit CAS needs `coord-writer`
+end-to-end (the `docs/design-mint.md` "one credential per mutation"
+rule). A single handle that hides the fan-out internally
+(`BucketEventJournal` holds both stores and routes reads to base,
+writes to writer) is the impl shape; the trait split lets a read-only
+caller carry a strictly narrower type.
+
+The same shape applies to `NameClaims` (`read` is `coord-base`-fit;
+`try_claim` / `release` / `force_release` need `coord-writer`) and
+`OwnIdentity` (other coordinators' identity material is reader-only;
+self-publish is writer).
 
 Each handle is the *full* operation surface for that object class —
 it does **not** further fan out into sub-handles per verb. The cut is
@@ -126,20 +167,20 @@ The complete coordinator-side object surface, by handle. Each row is
 externally, so an `If-Match` write is impossible without first
 reading.
 
-### `EventJournal` (`coord-writer`, `events/<name>/`)
+### `EventJournal` (`coord-writer` for emit, `coord-base` for reads)
 
-| Op | Today | Domain shape |
-|---|---|---|
-| Read HEAD | `GET events/<name>/HEAD` | `read_head(name) -> Option<EventHead>` |
-| Append | CAS HEAD then `PUT events/<name>/<ulid>` | `append(name, prev_head, VolumeEvent) -> Result<EventHead, EventConflict>` |
-| Read recent | `GET HEAD` + walk `prev_event_ulid` chain via `GET` | `recent(name, n) -> Vec<VolumeEvent>` |
-| Verify | re-derive sig | `verify(event, peer_pubkey) -> bool` |
+| Op | Today | Domain shape | Trait |
+|---|---|---|---|
+| Read HEAD | `GET events/<name>/HEAD` | `read_head(name) -> Option<(EventHead, EventHeadToken)>` | `EventJournalReader` |
+| Read recent | `GET HEAD` + walk `prev_event_ulid` via `GET` | `recent(name, n) -> Vec<VolumeEvent>` | `EventJournalReader` |
+| Read + verify | recent + per-event sig check | `list_and_verify(name, n) -> Vec<VolumeEventEntry>` | `EventJournalReader` |
+| Emit (mint+sign+CAS append) | CAS HEAD then `PUT events/<name>/<ulid>` | `emit(identity, name, kind, vol_ulid) -> Result<VolumeEvent, EventError>` | `EventJournal` |
 
-There is deliberately **no `delete` method on `EventJournal`**. The
-`events/` append-only invariant becomes a type-level property: a
-caller holding `EventJournal` cannot delete an event because the
-operation does not exist on the trait. The privileged offline reaper
-(if/when introduced) is a separate handle wielding an elevated
+There is deliberately **no `delete` method on `EventJournal`** (nor on
+its reader supertrait). The `events/` append-only invariant becomes a
+type-level property: a caller holding either trait cannot delete an
+event because the operation does not exist. The privileged offline
+reaper (if/when introduced) is a separate handle wielding an elevated
 credential, not a method here.
 
 ### `OwnIdentity` (`coord-writer`, `coordinators/<sub>/...`)
