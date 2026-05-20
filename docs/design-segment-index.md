@@ -100,6 +100,23 @@ time), and the per-tick HEAD PUT publishes the post-upload set.
 "Per-tick" never means "per GC tick" or "per reap tick"; both are
 gated sub-steps within the same drain tick.
 
+**Writer state: read-modify-write from S3 each active tick.** No
+cross-tick in-memory HEAD state, no local `since` log: each active
+tick the writer GETs current HEAD, merges in this tick's drain/GC/reap
+changes, and PUTs the new body. S3 HEAD is the single source of truth
+for the writer; the reap step is just one consumer of that per-tick
+read, not a special-cased path. Restart is trivially correct — the
+next active tick after restart does the GET as usual, no separate
+warm-up. A lost or 404 HEAD self-heals on the owner's next active tick
+(treat the GET result as empty and rewrite); in-flight `Superseded`
+edges lose their `since` values, so those edges are over-retained by
+one `retention_window` — benign, never under-retained. Cost is one
+GET + one PUT per active tick per volume — fixed-key, small body,
+operationally invisible at any realistic scale. Caching HEAD
+in-memory across ticks (one GET per coordinator restart instead of
+per tick) is a later optimisation lever if it ever appears in
+profiling; explicitly *not* a current gap.
+
 **Reaper fold: mechanic and SLA.** The reap step mirrors GC's
 existing gate exactly — a cross-tick `last_reap: Instant` on the
 orchestrator, fired inside `run_tick` whenever
@@ -349,9 +366,13 @@ Removing it from the runtime does not remove the need:
 - The **manifest spine has no reconcile to add** — it is signed and
   durable on its own (P1/P2, `design-volume-event-log.md`).
 - **HEAD is authoritative for the runtime**; readers trust it.
-  Bounded one-directional divergence is by construction (above), and a
-  lost HEAD self-heals: the owning tick loop rewrites it whole on its
-  next active tick from local `index/` + GC/reap state.
+  Bounded one-directional divergence is by construction (above). A
+  lost or 404 HEAD self-heals on the owner's next active tick: the
+  read-modify-write pass treats an empty GET as empty starting state
+  and rewrites. In-flight `Superseded` `since` values are unrecoverable
+  from local state (the GC output ULID is history-derived, not
+  wall-clock), so those edges are over-retained by one
+  `retention_window` — benign, never under-retained.
 - **Orphan reclamation** (un-indexed objects from a crash between the
   segment PUT and the HEAD PUT) is an *explicit operator maintenance
   pass* that may use a privileged LIST under a separate elevated
@@ -377,13 +398,3 @@ whatever is in S3 including segments past the latest snapshot" becomes
 writes absorbs HEAD by the same truncation rule as any seal. The
 coordinator-wide reaper task is removed; `reap_volume` becomes a
 gated step in `tasks.rs`'s per-volume loop.
-
-## Open questions
-
-- **Same-epoch reap without a HEAD read.** In-epoch the reap step
-  needs no HEAD GET — it has the `Superseded`/`since` state it wrote
-  this iteration and local `index/`. Only post-handoff must it read a
-  prior owner's HEAD. Whether to special-case the same-epoch path or
-  keep one uniform "read HEAD" path is an implementation call;
-  correctness is identical (the durability-ordering delete gate is
-  unchanged).
