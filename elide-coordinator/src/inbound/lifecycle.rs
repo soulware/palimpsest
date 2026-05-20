@@ -51,7 +51,6 @@ pub(crate) async fn stop_volume_op(
     force: bool,
     core: &CoordinatorCore,
     snapshot_locks: &SnapshotLockRegistry,
-    store: &Arc<dyn ObjectStore>,
     coord_id: &str,
     hostname: Option<&str>,
 ) -> Result<(), IpcError> {
@@ -134,8 +133,13 @@ pub(crate) async fn stop_volume_op(
     // `stop` must be able to recover from that. Halting our local
     // daemon never affects other hosts.
     if !readonly {
-        use elide_coordinator::lifecycle::{LifecycleError, mark_stopped};
-        match mark_stopped(store, volume_name, coord_id, hostname).await {
+        use elide_coordinator::lifecycle::LifecycleError;
+        match core
+            .stores
+            .name_claims()
+            .mark_stopped(volume_name, coord_id, hostname)
+            .await
+        {
             Ok(_) => {}
             Err(LifecycleError::OwnershipConflict { held_by }) => {
                 warn!(
@@ -199,7 +203,6 @@ pub(crate) async fn force_release_volume_op(
     stores: &Arc<dyn elide_coordinator::stores::ScopedStores>,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
 ) -> Result<ReleaseReply, IpcError> {
-    use elide_coordinator::lifecycle;
     use elide_coordinator::recovery;
 
     // Refuse when the "dead peer" is actually this host's running
@@ -311,7 +314,10 @@ pub(crate) async fn force_release_volume_op(
     .map_err(|e| IpcError::store(format!("publishing synthesised snapshot: {e}")))?;
 
     // Unconditional flip of names/<name>.
-    let outcome = lifecycle::mark_released_force(&writer, volume_name, published.snap_ulid).await;
+    let outcome = stores
+        .name_claims()
+        .mark_released_force(volume_name, published.snap_ulid)
+        .await;
     let journal = stores.event_journal();
     finalize_force_release(
         volume_name,
@@ -450,11 +456,13 @@ pub(crate) async fn release_volume_op(
             // the operator to detour through `start → stop` first just
             // to hand off a name they've already mentally given up.
             let journal = ctx.stores.event_journal();
+            let claims = ctx.stores.name_claims();
             return release_breadcrumb_only(
                 volume_name,
                 data_dir,
                 store,
                 journal.as_ref(),
+                claims.as_ref(),
                 identity,
                 coord_id,
                 started,
@@ -560,12 +568,13 @@ pub(crate) async fn release_volume_op(
                  (clean fork, never started)"
             );
             let journal = ctx.stores.event_journal();
+            let claims = ctx.stores.name_claims();
             let result = perform_release_flip(
                 volume_name,
                 data_dir,
                 &vol_dir,
-                store,
                 journal.as_ref(),
+                claims.as_ref(),
                 identity,
                 snap_ulid,
             )
@@ -610,12 +619,13 @@ pub(crate) async fn release_volume_op(
         cover.snap_ulid
     );
     let journal = ctx.stores.event_journal();
+    let claims = ctx.stores.name_claims();
     let result = perform_release_flip(
         volume_name,
         data_dir,
         &vol_dir,
-        store,
         journal.as_ref(),
+        claims.as_ref(),
         identity,
         cover.snap_ulid,
     )
@@ -656,11 +666,12 @@ async fn release_breadcrumb_only(
     data_dir: &Path,
     store: &Arc<dyn ObjectStore>,
     journal: &dyn elide_coordinator::event_journal::EventJournal,
+    claims: &dyn elide_coordinator::name_claims::NameClaims,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     coord_id: &str,
     started: std::time::Instant,
 ) -> Result<ReleaseReply, IpcError> {
-    use elide_coordinator::lifecycle::{self, MarkReleasedOutcome};
+    use elide_coordinator::lifecycle::MarkReleasedOutcome;
 
     // Breadcrumb is the local fingerprint of "we still own this
     // name remotely". Without one, this volume isn't a candidate for
@@ -712,7 +723,7 @@ async fn release_breadcrumb_only(
          (no local fork, no drain needed)"
     );
 
-    let outcome = lifecycle::mark_released(store, volume_name, coord_id, snap_ulid).await;
+    let outcome = claims.mark_released(volume_name, coord_id, snap_ulid).await;
     match outcome {
         Ok(MarkReleasedOutcome::Updated { vol_ulid }) => {
             info!(
@@ -911,18 +922,19 @@ async fn perform_release_flip(
     volume_name: &str,
     data_dir: &Path,
     vol_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
     journal: &dyn elide_coordinator::event_journal::EventJournal,
+    claims: &dyn elide_coordinator::name_claims::NameClaims,
     identity: &Arc<elide_coordinator::identity::CoordinatorIdentity>,
     snap_ulid: ulid::Ulid,
 ) -> Result<ReleaseReply, IpcError> {
-    use elide_coordinator::lifecycle::{self, MarkReleasedOutcome};
+    use elide_coordinator::lifecycle::MarkReleasedOutcome;
     let flip_started = std::time::Instant::now();
     info!(
         "[release {volume_name}] flipping names/<name> -> Released \
          with handoff snapshot {snap_ulid}"
     );
-    match lifecycle::mark_released(store, volume_name, identity.coordinator_id_str(), snap_ulid)
+    match claims
+        .mark_released(volume_name, identity.coordinator_id_str(), snap_ulid)
         .await
     {
         Ok(MarkReleasedOutcome::Updated { vol_ulid }) => {
@@ -1354,8 +1366,13 @@ pub(crate) async fn start_volume_op(
         warn!("[inbound] start {volume_name}: self-heal key shadow: {e}");
     }
 
-    use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome, mark_live};
-    match mark_live(&store, volume_name, coord_id, hostname).await {
+    use elide_coordinator::lifecycle::{LifecycleError, MarkLiveOutcome};
+    match core
+        .stores
+        .name_claims()
+        .mark_live(volume_name, coord_id, hostname)
+        .await
+    {
         Ok(MarkLiveOutcome::Resumed) | Ok(MarkLiveOutcome::AlreadyLive) => {}
         Ok(MarkLiveOutcome::Absent) => {
             // No S3 record yet — proceed local-only.
@@ -2223,17 +2240,9 @@ mod tests {
         // `force = true`: this test exercises only the bucket-state
         // handling, not the drain/snapshot path (the test fixture has
         // no running daemon to IPC).
-        stop_volume_op(
-            "vol",
-            true,
-            &core,
-            &snapshot_locks,
-            &store,
-            "coord-self",
-            None,
-        )
-        .await
-        .expect("stop must halt locally regardless of bucket state");
+        stop_volume_op("vol", true, &core, &snapshot_locks, "coord-self", None)
+            .await
+            .expect("stop must halt locally regardless of bucket state");
 
         // Local marker now present.
         let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
@@ -2266,17 +2275,9 @@ mod tests {
 
         let core = test_core(data_dir.path(), &store);
         let snapshot_locks = SnapshotLockRegistry::default();
-        stop_volume_op(
-            "vol",
-            true,
-            &core,
-            &snapshot_locks,
-            &store,
-            "coord-self",
-            None,
-        )
-        .await
-        .expect("stop must halt locally despite foreign bucket state");
+        stop_volume_op("vol", true, &core, &snapshot_locks, "coord-self", None)
+            .await
+            .expect("stop must halt locally despite foreign bucket state");
 
         let vol_dir = data_dir.path().join("by_id").join(vol_ulid.to_string());
         assert!(vol_dir.join(STOPPED_FILE).exists());

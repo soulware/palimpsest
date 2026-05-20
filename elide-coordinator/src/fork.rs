@@ -279,8 +279,8 @@ impl ForkOrchestrator {
                 } else {
                     self.job
                         .append(ForkAttachEvent::ResolvingName { name: name.clone() });
-                    let store = self.ctx.core.stores.writer();
-                    let reply = resolve_name_op(name, &store).await?;
+                    let claims = self.ctx.core.stores.name_claims_ro();
+                    let reply = resolve_name_op(name, claims.as_ref()).await?;
                     ResolvedSource {
                         vol_ulid: reply.vol_ulid,
                         name: Some(name.clone()),
@@ -538,11 +538,11 @@ impl ForkOrchestrator {
 /// Errors NotFound when the name has no S3 record.
 async fn resolve_name_op(
     name: &str,
-    store: &Arc<dyn ObjectStore>,
+    claims: &dyn elide_coordinator::name_claims::NameClaimsReader,
 ) -> Result<ResolveNameReply, IpcError> {
     validate_volume_name(name).map_err(IpcError::bad_request)?;
-    match elide_coordinator::name_store::read_name_record(store, name).await {
-        Ok(Some((rec, _))) => Ok(ResolveNameReply {
+    match claims.read(name).await {
+        Ok(Some(rec)) => Ok(ResolveNameReply {
             vol_ulid: rec.vol_ulid,
         }),
         Ok(None) => Err(IpcError::not_found(format!(
@@ -930,16 +930,19 @@ async fn fork_create_op(
     let src_name = src_cfg.name.or_else(|| source_name_hint.map(str::to_owned));
 
     // Phase 3: claim `names/<name>` in S3.
-    use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome, mark_initial};
-    match mark_initial(
-        store,
-        new_name,
-        coord_id,
-        identity.hostname(),
-        new_vol_ulid_value,
-        size,
-    )
-    .await
+    use elide_coordinator::lifecycle::{LifecycleError, MarkInitialOutcome};
+    match ctx
+        .core
+        .stores
+        .name_claims()
+        .mark_initial(
+            new_name,
+            coord_id,
+            identity.hostname(),
+            new_vol_ulid_value,
+            size,
+        )
+        .await
     {
         Ok(MarkInitialOutcome::Claimed) => {
             // `volume create --from` mints a fork, so the opening
