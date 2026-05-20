@@ -576,20 +576,24 @@ fn select_buckets(
 /// configured retention window — see `crate::reaper` and
 /// `docs/design-replica-model.md`.
 ///
-/// Returns the number of handoffs completed.
+/// Returns one [`HandoffOutcome`] per handoff completed end-to-end this
+/// tick — the orchestrator feeds these into the per-volume HEAD's
+/// `Added` (the output ULID) and `Superseded` (input → output edges)
+/// per `docs/design-segment-index.md`. Handoffs that deferred (volume
+/// not running) are absent from the returned vec and retried next tick.
 pub async fn apply_done_handoffs(
     fork_dir: &Path,
     volume_id: &str,
     store: &Arc<dyn ObjectStore>,
-) -> Result<usize> {
+) -> Result<Vec<HandoffOutcome>> {
     let gc_dir = fork_dir.join("gc");
     if !gc_dir.try_exists().context("checking gc dir")? {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     let bare = collect_bare_handoffs(&gc_dir)?;
     if bare.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     // Load vk + parse volume_ulid once. Both are needed by every iteration;
@@ -608,17 +612,27 @@ pub async fn apply_done_handoffs(
         uploader: crate::upload::SegmentUploader { volume_id, store },
     };
 
-    let mut count = 0;
+    let mut outcomes: Vec<HandoffOutcome> = Vec::new();
     for entry in &bare {
         let filename = entry.file_name();
         let name = filename
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("gc filename is not valid UTF-8"))?;
-        if cursor.process_one(name, &entry.path()).await? {
-            count += 1;
+        if let Some(outcome) = cursor.process_one(name, &entry.path()).await? {
+            outcomes.push(outcome);
         }
     }
-    Ok(count)
+    Ok(outcomes)
+}
+
+/// One GC handoff that completed end-to-end this tick: a new `output`
+/// segment was uploaded to S3 and promoted on the volume, and the
+/// `inputs` listed are now dead. Fed into the per-volume HEAD's `Added`
+/// (the output) and `Superseded` (one edge per input) by the
+/// orchestrator — see `docs/design-segment-index.md`.
+pub struct HandoffOutcome {
+    pub output: Ulid,
+    pub inputs: Vec<Ulid>,
 }
 
 /// Bare-named `gc/<ulid>` files are volume-applied handoffs awaiting S3
@@ -663,10 +677,10 @@ struct HandoffCursor<'a> {
 
 impl HandoffCursor<'_> {
     /// Run upload → promote → marker → input-cache cleanup → finalize for
-    /// one bare `gc/<name>` file. Returns `true` if the handoff completed
-    /// end-to-end; `false` if a step deferred (volume not running) — the
-    /// next tick retries idempotently.
-    async fn process_one(&self, name: &str, gc_body: &Path) -> Result<bool> {
+    /// one bare `gc/<name>` file. Returns `Some(outcome)` if the handoff
+    /// completed end-to-end; `None` if a step deferred (volume not
+    /// running) — the next tick retries idempotently.
+    async fn process_one(&self, name: &str, gc_body: &Path) -> Result<Option<HandoffOutcome>> {
         let new_ulid =
             Ulid::from_string(name).map_err(|e| anyhow::anyhow!("invalid gc filename: {e}"))?;
         let new_ulid_str = new_ulid.to_string();
@@ -699,7 +713,7 @@ impl HandoffCursor<'_> {
         // in place — we delete it at the end via `finalize_gc_handoff`.
         if !crate::control::promote_segment(self.fork_dir, new_ulid).await {
             warn!("[gc] promote {new_ulid_str}: volume not running; will retry next tick");
-            return Ok(false);
+            return Ok(None);
         }
 
         // Write a retention marker at `retention/<gc_output_ulid>` listing
@@ -735,10 +749,13 @@ impl HandoffCursor<'_> {
         // no more retries for this handoff.
         if !crate::control::finalize_gc_handoff(self.fork_dir, new_ulid).await {
             warn!("[gc] finalize {new_ulid_str}: volume not running; will retry next tick");
-            return Ok(false);
+            return Ok(None);
         }
 
-        Ok(true)
+        Ok(Some(HandoffOutcome {
+            output: new_ulid,
+            inputs,
+        }))
     }
 }
 
@@ -1795,10 +1812,10 @@ mod tests {
     async fn done_no_gc_dir() {
         let tmp = TempDir::new().unwrap();
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", &store)
+        let outcomes = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
-        assert_eq!(n, 0);
+        assert!(outcomes.is_empty());
     }
 
     #[tokio::test]
@@ -1806,10 +1823,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("gc")).unwrap();
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", &store)
+        let outcomes = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
-        assert_eq!(n, 0);
+        assert!(outcomes.is_empty());
     }
 
     #[tokio::test]
@@ -1823,10 +1840,10 @@ mod tests {
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.plan"), "").unwrap();
         fs::write(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.staged"), "").unwrap();
         let store = make_store();
-        let n = apply_done_handoffs(tmp.path(), "vol", &store)
+        let outcomes = apply_done_handoffs(tmp.path(), "vol", &store)
             .await
             .unwrap();
-        assert_eq!(n, 0);
+        assert!(outcomes.is_empty());
         // Files should be untouched.
         assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.plan").exists());
         assert!(gc_dir.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.staged").exists());
@@ -1919,7 +1936,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            done > 0,
+            !done.is_empty(),
             "apply_done_handoffs should have processed the handoff"
         );
 
@@ -2887,7 +2904,7 @@ mod tests {
         let done = apply_done_handoffs(dir, "00000000000000000000000000", &store)
             .await
             .unwrap();
-        assert!(done > 0, "handoff should complete");
+        assert!(!done.is_empty(), "handoff should complete");
 
         // Crash + reopen — rebuild from index/*.idx.
         let vol = elide_core::volume::Volume::open(dir, dir).unwrap();

@@ -948,6 +948,11 @@ pub(crate) async fn snapshot_volume_kind(
     }
 
     let _ = elide_coordinator::control::apply_gc_handoffs(&fork_dir).await;
+    // Outcomes from handoffs draining during a snapshot seal are folded
+    // into the manifest itself (the consumed inputs are excluded from
+    // the manifest's segment_ulids) and HEAD is truncated to empty
+    // post-seal, so the orchestrator doesn't need them — drop on the
+    // floor here. See `docs/design-segment-index.md` *Truncation*.
     elide_coordinator::gc::apply_done_handoffs(&fork_dir, &volume_id, &store)
         .await
         .map_err(|e| IpcError::store(format!("draining gc handoffs: {e:#}")))?;
