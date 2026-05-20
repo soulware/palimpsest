@@ -253,9 +253,9 @@ pub(crate) async fn force_release_volume_op(
     // All by_id/<dead_vol>/* ops below ride this store.
     let dead_store = stores.data_for_volume(&dead_vol_ulid);
 
-    // Recovery pipeline: fetch dead fork's pubkey, then either
-    // promote an existing stop-snapshot (fast path) or synthesise a
-    // fresh handoff manifest from S3-visible segments (slow path).
+    // Recovery pipeline: fetch dead fork's pubkey, then synthesise a
+    // fresh handoff manifest from the dead fork's HEAD-enumerated
+    // live segment set.
     //
     // If `volume.pub` is absent the dead fork crashed during the
     // create-time window before the coordinator published it. No
@@ -269,49 +269,6 @@ pub(crate) async fn force_release_volume_op(
                 "fetching volume.pub for released fork {dead_vol_ulid}: {e:#}"
             ))
         })?;
-
-    // Fast path: if the dead owner went through a clean `stop` before
-    // becoming unreachable, an `<S>-stop.manifest` is in S3 covering
-    // the durable state at that point. Promote it server-side
-    // instead of re-deriving the segment list. The promoted manifest
-    // retains the dead owner's signature; claimants verify it under
-    // the dead fork's `volume.pub`, same as any user snapshot.
-    if let Some(dead_pub_ref) = dead_pub.as_ref() {
-        match recovery::try_promote_stop_snapshot_for_force_release(
-            &dead_store,
-            dead_vol_ulid,
-            dead_pub_ref,
-        )
-        .await
-        {
-            Ok(Some(promoted)) => {
-                info!(
-                    "[inbound] force-release {volume_name}: fast path — promoted \
-                     dead owner's stop-snapshot {} (signed by dead volume.pub, \
-                     no recovery metadata)",
-                    promoted.snap_ulid
-                );
-                let outcome =
-                    lifecycle::mark_released_force(&writer, volume_name, promoted.snap_ulid).await;
-                return finalize_force_release(
-                    volume_name,
-                    data_dir,
-                    &writer,
-                    identity,
-                    promoted.snap_ulid,
-                    outcome,
-                )
-                .await;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    "[inbound] force-release {volume_name}: stop-snapshot \
-                     promotion failed ({e:#}); falling back to synthesis"
-                );
-            }
-        }
-    }
 
     let segment_ulids: Vec<ulid::Ulid> = match dead_pub {
         Some(dead_pub) => {
@@ -1714,19 +1671,13 @@ mod tests {
         assert_eq!(rec.vol_ulid, dead_vol);
         assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
 
-        // Synthesised manifest landed under the dead fork's snapshots/ prefix.
-        let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
-        use futures::TryStreamExt;
-        let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
-        assert_eq!(listed.len(), 1, "exactly one synthesised snapshot");
-        assert!(
-            listed[0]
-                .location
-                .as_ref()
-                .ends_with(&format!("{snap_ulid}.manifest")),
-            "manifest path is {}",
-            listed[0].location.as_ref()
-        );
+        // Synthesised manifest landed at the predicted snapshot key.
+        let manifest_key =
+            elide_coordinator::upload::snapshot_manifest_key(&dead_vol.to_string(), snap_ulid);
+        store
+            .head(&manifest_key)
+            .await
+            .expect("synthesised manifest present at predicted key");
     }
 
     #[tokio::test]
@@ -1809,12 +1760,10 @@ mod tests {
         assert_eq!(rec.handoff_snapshot, Some(snap_ulid));
 
         // The synthesised manifest covers no segments.
-        let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
-        use futures::TryStreamExt;
-        let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
-        assert_eq!(listed.len(), 1);
+        let manifest_key =
+            elide_coordinator::upload::snapshot_manifest_key(&dead_vol.to_string(), snap_ulid);
         let manifest = store
-            .get(&listed[0].location)
+            .get(&manifest_key)
             .await
             .unwrap()
             .bytes()
@@ -1882,23 +1831,14 @@ mod tests {
         )
         .await
         .expect("force-release with one tampered segment must still succeed");
-        let snap_str = reply.handoff_snapshot.to_string();
+        let snap_ulid = reply.handoff_snapshot;
 
         // Verify the synthesised manifest contains exactly one segment ULID
         // — the good one. Read the manifest body and look for both ids.
-        use futures::TryStreamExt;
-        let snap_prefix = StorePath::from(format!("by_id/{dead_vol}/snapshots/"));
-        let listed: Vec<_> = store.list(Some(&snap_prefix)).try_collect().await.unwrap();
-        let entry = listed
-            .into_iter()
-            .find(|m| {
-                m.location
-                    .as_ref()
-                    .ends_with(&format!("{snap_str}.manifest"))
-            })
-            .expect("synthesised manifest exists");
+        let manifest_key =
+            elide_coordinator::upload::snapshot_manifest_key(&dead_vol.to_string(), snap_ulid);
         let manifest_body = store
-            .get(&entry.location)
+            .get(&manifest_key)
             .await
             .unwrap()
             .bytes()

@@ -195,43 +195,31 @@ impl ObjectStore for RoleStore {
         self.ensure().await?.delete(location).await
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
-        // `list` is sync-returning-a-stream, so it cannot await
-        // `ensure`. A spawned task owns the (re-assumed) store and its
-        // borrowed list stream together — no self-referential struct —
-        // and forwards items over a channel; the returned `'static`
-        // stream is just the receiver.
-        let prefix = prefix.cloned();
-        let (tx, rx) = tokio::sync::mpsc::channel::<OsResult<ObjectMeta>>(64);
-        let endpoint = self.endpoint.clone();
-        let store_cfg = self.store_cfg.clone();
-        let role = self.role;
-        let ttl = self.ttl_secs;
-        let vol = self.vol_ulid;
-        tokio::spawn(async move {
-            let facade = RoleStore::new(endpoint, store_cfg, role, ttl, vol);
-            let store = match facade.ensure().await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-            use futures::StreamExt;
-            let mut s = store.list(prefix.as_ref());
-            while let Some(item) = s.next().await {
-                if tx.send(item).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
+    fn list(&self, _prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        // No coordinator credential carries `s3:ListBucket`
+        // (`docs/list-elimination-plan.md` P5). Refuse locally
+        // rather than forward; a forward would 403 on Tigris with
+        // a generic S3 error. The `ObjectStore` trait requires
+        // this method on `RoleStore` as long as `MintScopedStores`
+        // returns `Arc<dyn ObjectStore>` —
+        // `project_objectstore_trait_overreach` tracks the
+        // higher-level surface narrowing that would let this fn
+        // not exist at all.
+        Box::pin(futures::stream::once(async {
+            Err(object_store::Error::NotSupported {
+                source: "coord-role credentials carry no s3:ListBucket; \
+                         see docs/list-elimination-plan.md"
+                    .into(),
+            })
         }))
     }
 
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
-        self.ensure().await?.list_with_delimiter(prefix).await
+    async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> OsResult<ListResult> {
+        Err(object_store::Error::NotSupported {
+            source: "coord-role credentials carry no s3:ListBucket; \
+                     see docs/list-elimination-plan.md"
+                .into(),
+        })
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {

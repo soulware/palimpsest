@@ -418,9 +418,10 @@ Ordered so each phase builds on the prior.
   `reaper`; rebuild defines the proptested reconcile invariant.
 - **P5 — drop the grant.** Delete `s3:ListBucket` from
   `mint/examples/elide_roles/coord-writer.json`, the §*`coord-writer`*
-  policy, and the role-inventory table in `design-mint.md`; add a CI
-  grep guard that no `.list(` reaches a mint-backed store. End state:
-  no role carries `ListBucket`.
+  policy, and the role-inventory table in `design-mint.md`. End state:
+  no role carries `ListBucket`. The structural guarantee is the role
+  policy itself — any errant `.list(` against a mint-backed store
+  fails with a 403 at runtime, surfaced by the existing e2e tests.
 
 ## Back-compat
 
@@ -448,6 +449,3 @@ a snapshot). No on-disk format negotiation, no runtime dual path.
   these legitimately enumerate and run under an explicit elevated
   credential, not the coordinator runtime; they are not in this
   removal.
-- The interim credential posture before P5 lands (the per-volume LIST
-  paths fail on Tigris under `coord-data` until then) — a separate
-  decision, tracked with the mint cutover, not here.

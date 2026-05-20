@@ -818,7 +818,7 @@ Elide's coordinator authenticates to mint and assumes **four roles**:
 | Role | Scope | Held by |
 |---|---|---|
 | `coord-base` | read-only `names/* coordinators/* events/*` | every coordinator; the *only* credential the exposed peer-fetch verifier holds |
-| `coord-writer` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`, `ListBucket`) | the non-exposed mutation paths |
+| `coord-writer` | the coordinator-wide write policy (`names/`, `events/`, own `coordinators/<sub>/`) | the non-exposed mutation paths |
 | `coord-data` | per-volume `by_id/<vol>/*` read+write (**Split B** — per-volume) | the coordinator, cached per vol_ulid |
 | `volume-ro` | per-volume lineage read, vended to the volume process | the coordinator (assumes), the volume (holds the keypair) |
 
@@ -899,10 +899,10 @@ covered by `coord-data` on that volume.)
 
 Coordinator-wide write authority: name claim / rename / force-release
 / rollback (`names/`), event-journal appends and reads (`events/`),
-this coordinator's own identity records (`coordinators/<sub>/`), and
-bucket enumeration (`ListBucket`). One role, one credential, one
-keypair cache. The IAM-layer invariants ride the policy *template*,
-not key partitioning:
+and this coordinator's own identity records
+(`coordinators/<sub>/`). One role, one credential, one keypair cache.
+The IAM-layer invariants ride the policy *template*, not key
+partitioning:
 
 - **Required caveats:** `sub`, `aud=mint`, `exp`
 - **TTL:** 1h. Control-plane, infrequent, refreshed on demand; the
@@ -921,17 +921,16 @@ not key partitioning:
     immutability** is enforced here; a leaked key can rewrite only
     *this* coordinator's identity, never impersonate another, and
     never delete.
-  - `s3:ListBucket` on `arn:aws:s3:::{{tenant.bucket}}` (bucket
-    resource, no object statement). `ListBucket` is irreducibly
-    bucket-global on Tigris — AWS prefix-scopes it via the `s3:prefix`
-    condition key, but Tigris supports **no string condition keys**
-    (only `IpAddress`/`NotIpAddress` and `Date*`,
-    [Tigris IAM policy support][tigris-iam-policies]). It exposes
-    object *keys* only (ULIDs, names, coord ids), never contents.
-    **Proposed (#12, `docs/list-elimination-plan.md`): this statement
-    is removed** — every LIST becomes a deterministic GET (latest-
-    pointer or maintained index), after which no role carries
-    `ListBucket`.
+
+No `s3:ListBucket` statement: every per-volume and control-plane
+LIST in the coordinator runtime has been replaced by a deterministic
+GET — latest-pointer (`snapshots/LATEST`,
+`events/<name>/HEAD`) or maintained delta (`by_id/<vol>/HEAD`,
+`docs/design-segment-index.md`). End state: no role carries
+`ListBucket`. The orphan-reclamation pass that *does* need
+bucket-global enumeration is an explicit operator maintenance verb,
+authenticated separately, outside the coordinator runtime
+(`docs/list-elimination-plan.md` § *Reconcile/repair without LIST*).
 
 ### `volume-ro`
 
@@ -1181,8 +1180,8 @@ not a convention.
 }
 ```
 
-`get`/`head` only — no `put`, `delete`, or `list` (`coord-base`
-carries no `ListBucket`; that is `coord-writer`'s). The exposed-surface
+`get`/`head` only — no `put`, `delete`, or `list` (no role carries
+`ListBucket`; see `coord-writer` above). The exposed-surface
 containment boundary is made *unrepresentable*, not merely
 unauthorized: a path holding `base_ro()` cannot call a mutating method
 because it does not exist on the type. This is the one boundary where
@@ -1402,49 +1401,26 @@ prematurely.
     stated in the role inventory but not fully specified — the exact set of
     roles a GC pass assumes, and whether the reaper's delete wants its own
     narrower role, is open.
-12. **Eliminate the `ListBucket` statement — resolved; see
-    `docs/list-elimination-plan.md`.** Decision: the coordinator
-    stops using `ListBucket` entirely, independent of whether any
-    given backend can prefix-scope it. `ListBucket` is the one grant
-    that is bucket-level by S3 design (prefix restriction is the
-    `s3:prefix` *condition*, not the Resource ARN); on Tigris the
-    standard lever is unavailable (only `IpAddress`/`Date*`
-    conditions), so a listing credential there can enumerate the whole
-    bucket's key space. Whether Tigris honours a non-standard
-    prefix-ARN `ListBucket` is untested and explicitly *not* relied
-    on. Removing the dependency is the robust, backend-portable answer
-    and also a long-wanted perf win; the coordinator's per-volume data
-    plane is pervasively LIST-driven over `by_id/<vol>/{snapshots,
-    segments,retention}/` (prefetch, recovery, fork-verify, the
-    reaper, snapshot resolution), so this is structural, not a corner.
-
-    **Proposed:** every LIST is replaced by a deterministic GET,
-    respecting the name/`vol_ulid` identity split. The per-name event
-    log is the spine (append-only, self-linking, a bounded
-    `events/<name>/HEAD` window of the last N signed records) and
-    already carries the cross-epoch handoff/fork snapshot
-    references (`Released`/`ForceReleased`/`ForkedFrom`) — no new event
-    kinds. The per-vol "latest snapshot" is a
-    `by_id/<vol>/snapshots/LATEST` pointer written under `coord-data`
-    (no cross-role write); no consumer needs a per-vol snapshot *set*.
-    Only the high-cardinality per-write sets keep a separate
-    **maintained index**:
-
-    - a per-volume segment index replaces the `segments/` LIST
-      (the WAL drain and GC append to it as they create objects); a
-      per-volume retention index replaces the `retention/` LIST (GC
-      appends supersession markers). The index, not LIST, is the
-      authoritative live set; a no-LIST reconcile/repair path covers
-      index/object divergence (LIST is today's implicit reconcile, so
-      its removal must be replaced, not merely dropped).
-
-    End state: **no role needs `ListBucket`** — `coord-writer`'s
-    `ListBucket` statement is deleted from its role template and from
-    the inventory above; `coord-data` never had it. The bucket-global
-    enumeration hole closes entirely rather than being confined.
-    Until this lands the per-volume LIST paths fail on Tigris under
-    `coord-data` (no `ListBucket`); the interim credential posture is a
-    separate decision, out of scope for this resolution.
+12. **Eliminate the `ListBucket` statement — done.** Plan in
+    `docs/list-elimination-plan.md` (P1–P5), shipped across PRs
+    #395–#399 (docs) and #400–#403 (impl). Every coordinator-runtime
+    LIST is now a deterministic GET: name-axis ordering via
+    `events/<name>/HEAD` (bounded window of the last N signed
+    records, `prev_event_ulid` chain backing); per-vol stable
+    snapshot via `by_id/<vol>/snapshots/LATEST`; post-snapshot
+    delta via `by_id/<vol>/HEAD`
+    (`docs/design-segment-index.md`); per-vol handoff via the
+    CAS'd `names/<name>` record, not a snapshot LIST. The
+    standalone reaper task is gone — reap is a tick-folded step
+    inside the per-volume orchestrator, consuming HEAD's
+    `Superseded` edges. `coord-writer`'s `ListBucket` statement
+    is removed from its role template and from the inventory
+    above; `coord-data` never had it. The bucket-global
+    enumeration hole closes entirely. Orphan reclamation (the
+    one remaining LIST need) is an explicit operator-privileged
+    maintenance pass, deliberately outside the runtime surface
+    (`docs/list-elimination-plan.md` § *Reconcile/repair without
+    LIST*).
 13. **Enrollment surface — settled.** See *Coordinator bootstrap* §
     *Enrollment*: reusable non-expiring bootstrap macaroon → coordinator
     self-asserts `sub`/`cnf` and `POST /v1/enroll` creates a pending
@@ -1559,4 +1535,3 @@ around:
 
 [assume-role-web-identity]: https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html
 [session-tags]: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_session-tags.html
-[tigris-iam-policies]: https://www.tigrisdata.com/docs/iam/policies/

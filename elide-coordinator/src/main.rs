@@ -211,8 +211,7 @@ async fn run() -> Result<()> {
                 "[coordinator] store scoping: shared-key passthrough \
                  (single AWS_* key for every op; no per-volume scoping)"
             );
-            config.store.probe(store.as_ref()).await?;
-            tracing::info!("[coordinator] store: reachable");
+            config.store.precheck_env()?;
 
             // Verify conditional-PUT support up front: the lifecycle
             // verbs (`mark_stopped`, `mark_released`,
