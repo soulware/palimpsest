@@ -269,14 +269,16 @@ It is also not a parallel full index: the latest signed snapshot
 manifest already enumerates the full live segment set (reachable
 LIST-free via P2's `LATEST`), so the maintained object is a **second
 manifest for the post-snapshot delta** — a single per-vol object
-(`by_id/<vol>/tail`, fixed key like `snapshots/LATEST`),
-whole-object-overwritten by the per-volume tick loop, holding
-`Added`/`Superseded`/`Tombstoned` entries over the current anchor.
-P3 **folds the reaper into the per-volume tick loop** as a gated step,
-making that loop the sole writer (drain → GC → reap sequential): one
-GET reads the whole tail at any cardinality, write cost is per-tick
-not per-segment, and truncation is the writer emptying the object at
-each seal — no lock, no chain, no compaction heuristic. Replaces
+(`by_id/<vol>/HEAD`, fixed key like `snapshots/LATEST`, named for
+the same reason as `events/<name>/HEAD`: the leading edge of activity
+since the latest seal), whole-object-overwritten by the per-volume
+tick loop, holding `Added`/`Superseded`/`Tombstoned` entries over the
+current anchor. P3 **folds the reaper into the per-volume tick loop**
+as a gated step, making that loop the sole writer (drain → GC → reap
+sequential): one GET reads the whole HEAD at any cardinality, HEAD is
+PUT per drain tick on any state change (not per GC tick), and
+truncation is the writer emptying the object at each seal — no lock,
+no chain, no compaction heuristic. Replaces
 `prefetch.rs:442`, `fork.rs:670`, `recovery.rs:165`,
 `prefetch.rs:643`, `reaper.rs:80`. Full design and the rebuild
 invariant: [`design-segment-index.md`](design-segment-index.md).
@@ -399,17 +401,19 @@ Ordered so each phase builds on the prior.
   cleanup consumers (`lifecycle.rs:560/707/1502`) at the P1 chain
   walk / known-key delete. Removes every snapshot LIST; no new events,
   no cross-role write.
-- **P3 (folds in P4) — segment tail-delta manifest.** Specified in
+- **P3 (folds in P4) — per-volume HEAD.** Specified in
   [`design-segment-index.md`](design-segment-index.md). A single
-  per-vol object (`by_id/<vol>/tail`) — a *second manifest* for the
-  post-snapshot delta over P2's `LATEST` anchor, whole-object
-  overwritten. The reaper is **folded into the per-volume tick loop**
-  as a gated step, making that loop the sole writer (drain → GC → reap
-  sequential): one GET reads the whole tail, write cost is per-tick,
-  truncation is the writer emptying the object at each seal — no lock,
-  no chain. Segment and retention/supersession entries fold into the
-  **one** object (the "may collapse into one" choice, taken).
-  Segment-objects-before-tail-PUT crash ordering; migrate
+  per-vol object (`by_id/<vol>/HEAD`, named for the same reason as
+  `events/<name>/HEAD`: the leading edge of activity over its axis) —
+  a *second manifest* for the post-snapshot delta over P2's `LATEST`
+  anchor, whole-object overwritten. The reaper is **folded into the
+  per-volume tick loop** as a gated step, making that loop the sole
+  writer (drain → GC → reap sequential): one GET reads the whole
+  HEAD, HEAD is PUT per drain tick on any state change, truncation
+  is the writer emptying the object at each seal — no lock, no chain.
+  Segment and retention/supersession entries fold into the **one**
+  object (the "may collapse into one" choice, taken).
+  Segment-objects-before-HEAD-PUT crash ordering; migrate
   `prefetch`/`recovery`/`fork-verify` *and* `prefetch` supersession +
   `reaper`; rebuild defines the proptested reconcile invariant.
 - **P5 — drop the grant.** Delete `s3:ListBucket` from
