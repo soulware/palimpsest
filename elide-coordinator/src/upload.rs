@@ -161,13 +161,20 @@ pub fn mark_already_uploaded(
 pub struct DrainResult {
     /// Segments observed in `pending/` at the start of the tick.
     pub seen: usize,
-    pub uploaded: usize,
     /// Segments whose S3 PUT failed. Likely a persistent store-side issue.
     pub upload_failed: usize,
     /// Segments that uploaded to S3 but whose promote IPC to the volume
     /// process did not succeed. Typically transient (startup/shutdown race);
     /// the pending file stays in place and the next tick retries.
     pub promote_failed: usize,
+    /// ULIDs of segments confirmed uploaded *and* promoted this tick.
+    /// Fed into the per-volume HEAD's `Added` set by the orchestrator
+    /// (`docs/design-segment-index.md`). Excludes upload-failed and
+    /// promote-failed segments — those still sit in `pending/` and are
+    /// retried next tick, so they are not yet durable from a reader's
+    /// perspective. The count of "uploaded this tick" is
+    /// `uploaded_ulids.len()`.
+    pub uploaded_ulids: Vec<Ulid>,
 }
 
 /// Return the volume ULID from a volume directory path.
@@ -315,9 +322,9 @@ pub async fn drain_pending(
     // caller has already run repack, so every remaining pending file
     // is upload-ready.
 
-    let mut uploaded = 0usize;
     let mut upload_failed = 0usize;
     let mut promote_failed = 0usize;
+    let mut uploaded_ulids: Vec<Ulid> = Vec::new();
     let uploader = SegmentUploader { volume_id, store };
 
     let pending_snapshot = elide_core::segment::read_ulid_dir_sorted(&pending_dir)
@@ -333,7 +340,7 @@ pub async fn drain_pending(
                 // process (volume or import in serve phase) to write index/ +
                 // cache/ and delete pending/<ulid>.
                 if crate::control::promote_segment(vol_dir, ulid).await {
-                    uploaded += 1;
+                    uploaded_ulids.push(ulid);
                 } else {
                     // S3 PUT succeeded but the volume control socket was
                     // unreachable or the IPC reply was an error envelope.
@@ -356,9 +363,9 @@ pub async fn drain_pending(
 
     Ok(DrainResult {
         seen,
-        uploaded,
         upload_failed,
         promote_failed,
+        uploaded_ulids,
     })
 }
 
@@ -569,10 +576,33 @@ pub async fn upload_snapshot_metadata(
                 // are not pointed at: their recovery role is served by
                 // the `Stopped` event on the spine. A failure here must
                 // not fail the upload (self-heals on the next publish).
-                if kind == elide_core::signing::SnapshotKind::User
-                    && let Err(e) = bump_latest_snapshot(store, volume_id, snap_ulid).await
-                {
-                    warn!("[upload] bumping snapshots/LATEST for {snap_ulid}: {e}");
+                if kind == elide_core::signing::SnapshotKind::User {
+                    if let Err(e) = bump_latest_snapshot(store, volume_id, snap_ulid).await {
+                        warn!("[upload] bumping snapshots/LATEST for {snap_ulid}: {e}");
+                    }
+                    // Truncate the post-snapshot HEAD: the new manifest
+                    // absorbs every live segment, so the delta over it
+                    // starts empty. Single writer (the seal is the same
+                    // tick loop / inbound handler that authors HEAD), so
+                    // a plain unconditional PUT — same pattern as
+                    // `snapshots/LATEST`. See `docs/design-segment-index.md`
+                    // *Truncation*.
+                    let vol_ulid = match ulid::Ulid::from_string(volume_id) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            warn!(
+                                "[upload] truncating HEAD: volume_id {volume_id} not a ULID: {e}"
+                            );
+                            continue;
+                        }
+                    };
+                    let empty = crate::segment_head::SegmentHead::empty(Some(snap_ulid));
+                    if let Err(e) = crate::segment_head::put_head(store, vol_ulid, &empty).await {
+                        warn!(
+                            "[upload] truncating HEAD for {snap_ulid}: {e}; \
+                             self-heals on next active tick"
+                        );
+                    }
                 }
             }
             Err(e) => warn!("snapshot manifest upload failed for {key}: {e:#}"),
@@ -787,7 +817,7 @@ mod tests {
 
         let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
-        assert_eq!(result.uploaded, 2);
+        assert_eq!(result.uploaded_ulids.len(), 2);
         assert_eq!(result.upload_failed, 0);
         assert_eq!(result.promote_failed, 0);
 
@@ -836,7 +866,7 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
         let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
-        assert_eq!(result.uploaded, 0);
+        assert_eq!(result.uploaded_ulids.len(), 0);
         assert_eq!(result.upload_failed, 0);
         assert_eq!(result.promote_failed, 0);
 
