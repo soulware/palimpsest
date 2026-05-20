@@ -246,7 +246,10 @@ impl GcCycleOrchestrator {
                 if r.seen > 0 {
                     info!(
                         "[drain {volume_id}] pending={} uploaded={} upload_failed={} promote_failed={}",
-                        r.seen, r.uploaded, r.upload_failed, r.promote_failed,
+                        r.seen,
+                        r.uploaded_ulids.len(),
+                        r.upload_failed,
+                        r.promote_failed,
                     );
                 }
                 if r.upload_failed > 0 {

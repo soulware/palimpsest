@@ -161,7 +161,6 @@ pub fn mark_already_uploaded(
 pub struct DrainResult {
     /// Segments observed in `pending/` at the start of the tick.
     pub seen: usize,
-    pub uploaded: usize,
     /// Segments whose S3 PUT failed. Likely a persistent store-side issue.
     pub upload_failed: usize,
     /// Segments that uploaded to S3 but whose promote IPC to the volume
@@ -173,7 +172,8 @@ pub struct DrainResult {
     /// (`docs/design-segment-index.md`). Excludes upload-failed and
     /// promote-failed segments — those still sit in `pending/` and are
     /// retried next tick, so they are not yet durable from a reader's
-    /// perspective.
+    /// perspective. The count of "uploaded this tick" is
+    /// `uploaded_ulids.len()`.
     pub uploaded_ulids: Vec<Ulid>,
 }
 
@@ -322,7 +322,6 @@ pub async fn drain_pending(
     // caller has already run repack, so every remaining pending file
     // is upload-ready.
 
-    let mut uploaded = 0usize;
     let mut upload_failed = 0usize;
     let mut promote_failed = 0usize;
     let mut uploaded_ulids: Vec<Ulid> = Vec::new();
@@ -341,7 +340,6 @@ pub async fn drain_pending(
                 // process (volume or import in serve phase) to write index/ +
                 // cache/ and delete pending/<ulid>.
                 if crate::control::promote_segment(vol_dir, ulid).await {
-                    uploaded += 1;
                     uploaded_ulids.push(ulid);
                 } else {
                     // S3 PUT succeeded but the volume control socket was
@@ -365,7 +363,6 @@ pub async fn drain_pending(
 
     Ok(DrainResult {
         seen,
-        uploaded,
         upload_failed,
         promote_failed,
         uploaded_ulids,
@@ -820,7 +817,7 @@ mod tests {
 
         let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
 
-        assert_eq!(result.uploaded, 2);
+        assert_eq!(result.uploaded_ulids.len(), 2);
         assert_eq!(result.upload_failed, 0);
         assert_eq!(result.promote_failed, 0);
 
@@ -869,7 +866,7 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(store_tmp.path()).unwrap());
 
         let result = drain_pending(&vol_dir, VOL_ULID, &store).await.unwrap();
-        assert_eq!(result.uploaded, 0);
+        assert_eq!(result.uploaded_ulids.len(), 0);
         assert_eq!(result.upload_failed, 0);
         assert_eq!(result.promote_failed, 0);
 
